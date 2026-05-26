@@ -26,7 +26,7 @@ REFRESH_INTERVAL = 0.5
 class Dashboard:
 
     def __init__(self, beta, gamma, mu, V, u_opt, g_array, S_grid, I_grid,
-                 alpha, T):
+                 alpha, T, stopped_frac=0.0):
         self.beta = beta
         self.gamma = gamma
         self.mu = mu
@@ -38,6 +38,7 @@ class Dashboard:
         self.I_grid = I_grid
         self.alpha = alpha
         self.T = T
+        self.stopping = stopped_frac > 0.01
 
         self.beta_eff = beta
         self.gamma_eff = gamma
@@ -83,12 +84,13 @@ class Dashboard:
             self._worker_status = f"solving α={alpha:.2f}"
             t0 = time.monotonic()
             try:
-                V_new, u_new, S_g, I_g, g_new = solve_hjb(
+                V_new, u_new, S_g, I_g, g_new, stopped_frac = solve_hjb(
                     beta_eff, gamma_eff, alpha, T=self.T, mu=mu,
                 )
                 dur = time.monotonic() - t0
                 self.solve_result_q.put((alpha, beta_eff, gamma_eff,
-                                         V_new, u_new, S_g, I_g, g_new, dur))
+                                         V_new, u_new, S_g, I_g, g_new,
+                                         stopped_frac, dur))
             except Exception as e:
                 self.solve_result_q.put(("error", e))
             self._worker_status = "idle"
@@ -107,7 +109,8 @@ class Dashboard:
                 self._worker_status = f"error: {result[1]}"
                 return
             (alpha_done, beta_eff, gamma_eff,
-             V_new, u_new, S_g, I_g, g_new, dur) = result
+             V_new, u_new, S_g, I_g, g_new,
+             stopped_frac, dur) = result
             self.alpha = alpha_done
             self.beta_eff = beta_eff
             self.gamma_eff = gamma_eff
@@ -116,6 +119,7 @@ class Dashboard:
             self.S_grid = S_g
             self.I_grid = I_g
             self.g_array = g_new
+            self.stopping = stopped_frac > 0.01
             self._last_solve_dur = dur
         except queue.Empty:
             pass
@@ -256,6 +260,7 @@ class Dashboard:
         jump_p = state.get("jump_prob", 0.007)
         q_delay = state.get("quarantine_delay", 3.0)
 
+        stopping_str = "Yes" if self.stopping else "No"
         lines = [
             "── State ──",
             f"t     = {t:.1f}",
@@ -265,6 +270,7 @@ class Dashboard:
             f"D     = {D:.4f}",
             f"u*    = {u:.4f}",
             f"R0eff = {R0eff:.2f}",
+            f"Stopping: {stopping_str}",
             "",
             "── Params ──",
             f"α     = {self.alpha:.2f}",

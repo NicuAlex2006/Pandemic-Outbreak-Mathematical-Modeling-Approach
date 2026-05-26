@@ -47,10 +47,11 @@ def main():
     print(f"  CFR = {cfr*100:.2f}%")
 
     print("=== Startup: initial HJB solve ===")
-    V, u_opt, S_grid, I_grid, g_array = solve_hjb(
+    V, u_opt, S_grid, I_grid, g_array, stopped_frac = solve_hjb(
         beta, gamma, ALPHA_DEFAULT, T=T_SIM, mu=mu,
     )
     print(f"  V range: [{V.min():.3f}, {V.max():.3f}]  u_opt: {u_opt.shape}")
+    print(f"  Stopping: {'Yes' if stopped_frac > 0.01 else 'No'} ({stopped_frac:.1%})")
 
     print("=== Startup: binomial stopping tree ===")
     _, stop_tree, betas_tree = solve_binomial_stopping(beta, gamma, I0_DEFAULT)
@@ -72,6 +73,7 @@ def main():
         V=V, u_opt=u_opt, g_array=g_array,
         S_grid=S_grid, I_grid=I_grid,
         alpha=ALPHA_DEFAULT, T=T_SIM,
+        stopped_frac=stopped_frac,
     )
 
     world = World(shared_state=shared_state)

@@ -54,11 +54,11 @@ def fetch_france_data():
 
 
 def solve_hjb(beta, gamma, alpha, T, nS=40, nI=40, n_time=100, mu=0.0):
-    s, i, V, u_opt_2d, g_array, _snaps = _solve_hjb(
+    s, i, V, u_opt_2d, g_array, _snaps, stopped_frac = _solve_hjb(
         beta=beta, gamma=gamma, alpha=alpha, T=T, nS=nS, nI=nI, mu=mu,
     )
     u_opt = np.broadcast_to(u_opt_2d, (n_time, nS, nI)).copy()
-    return V, u_opt, s, i, g_array
+    return V, u_opt, s, i, g_array, stopped_frac
 
 
 def get_u_at(S_val, I_val, t_idx, u_opt, S_grid, I_grid):

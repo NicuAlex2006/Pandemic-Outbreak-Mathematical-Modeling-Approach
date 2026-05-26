@@ -1,7 +1,7 @@
 """
 Hamilton-Jacobi-Bellman solver for optimal control of the SIR epidemic model.
 
-Minimises J = integral_0^T [ alpha * I(t) + 0.5 * u(t)^2 ] dt
+Minimises J = integral_0^T [ alpha * I(t) + (c_u/2) * u(t)^2 ] dt
 subject to:
     dS/dt = -beta * (1 - u) * S * I
     dI/dt =  beta * (1 - u) * S * I - gamma * I
@@ -28,10 +28,12 @@ BETA = 0.4
 GAMMA = 0.1
 MU = 0.005           # mortality rate
 ALPHA = 1.0          # weight on infection cost
+C_U = 0.01           # control cost coefficient (was 0.5)
 T = 10.0             # time horizon
 NS = 51              # grid points in S direction
 NI = 51              # grid points in I direction
 CFL_SAFETY = 0.4     # fraction of CFL limit
+LF_VISCOSITY = 0.12  # Lax-Friedrichs viscosity scaling (was 0.5)
 
 
 # ---------------------------------------------------------------------------
@@ -72,13 +74,13 @@ def upwind_gradients(V, dS, dI):
 # Optimal control and Hamiltonian (vectorised)
 # ---------------------------------------------------------------------------
 
-def optimal_control(S_grid, I_grid, dVdS, dVdI, beta):
-    u_star = beta * S_grid * I_grid * (dVdI - dVdS)
+def optimal_control(S_grid, I_grid, dVdS, dVdI, beta, c_u=C_U):
+    u_star = beta * S_grid * I_grid * (dVdI - dVdS) / c_u
     return np.clip(u_star, 0.0, 1.0)
 
 
 def hamiltonian(S_grid, I_grid, dVdS, dVdI_bwd, dVdI_fwd, u,
-                alpha, beta, gamma, mu=0.0):
+                alpha, beta, gamma, mu=0.0, c_u=C_U):
     infection = beta * (1.0 - u) * S_grid * I_grid
     drift_S = -infection
     drift_I = infection - gamma * I_grid - mu * I_grid
@@ -86,8 +88,8 @@ def hamiltonian(S_grid, I_grid, dVdS, dVdI_bwd, dVdI_fwd, u,
     drift_I_pos = np.maximum(drift_I, 0.0)
     drift_I_neg = np.minimum(drift_I, 0.0)
 
-    death_penalty = 100.0 * alpha
-    running_cost = alpha * I_grid + death_penalty * mu * I_grid + 0.5 * u**2
+    death_penalty = 1000.0 * alpha
+    running_cost = alpha * I_grid + death_penalty * mu * I_grid + (c_u / 2.0) * u**2
     return (running_cost
             + dVdS * drift_S
             + dVdI_bwd * drift_I_pos
@@ -105,11 +107,11 @@ def compute_do_nothing_cost(S_grid, I_grid, beta, gamma, alpha, T,
     I_fwd = I_grid.copy()
     g_array = np.zeros_like(S_grid)
 
+    death_penalty = 1000.0 * alpha
     for _ in range(n_fwd):
         infection = beta * S_fwd * I_fwd
         dS = -infection
         dI = infection - gamma * I_fwd - mu * I_fwd
-        death_penalty = 100.0 * alpha
         g_array += (alpha * I_fwd + death_penalty * mu * I_fwd) * dt_fwd
         S_fwd = np.clip(S_fwd + dS * dt_fwd, 0.0, 1.0)
         I_fwd = np.clip(I_fwd + dI * dt_fwd, 0.0, 1.0)
@@ -122,7 +124,7 @@ def compute_do_nothing_cost(S_grid, I_grid, beta, gamma, alpha, T,
 # ---------------------------------------------------------------------------
 
 def solve_hjb(beta=BETA, gamma=GAMMA, alpha=ALPHA, T=T,
-              nS=NS, nI=NI, mu=MU):
+              nS=NS, nI=NI, mu=MU, c_u=C_U):
     s, i, dS, dI, S_grid, I_grid = build_grid(nS, nI)
 
     max_speed = beta + gamma + mu
@@ -130,9 +132,9 @@ def solve_hjb(beta=BETA, gamma=GAMMA, alpha=ALPHA, T=T,
     n_steps = int(np.ceil(T / dt))
     dt = T / n_steps
 
-    # Lax-Friedrichs viscosity coefficients
-    nu_S = 0.5 * dS * max_speed
-    nu_I = 0.5 * dI * max_speed
+    # Lax-Friedrichs viscosity coefficients (reduced to preserve gradients)
+    nu_S = LF_VISCOSITY * dS * max_speed
+    nu_I = LF_VISCOSITY * dI * max_speed
 
     print(f"  dt = {dt:.6f}, n_steps = {n_steps}")
 
@@ -142,7 +144,10 @@ def solve_hjb(beta=BETA, gamma=GAMMA, alpha=ALPHA, T=T,
                                        mu=mu)
     print(f"  g range: [{g_array.min():.4f}, {g_array.max():.4f}]")
 
-    V = np.zeros((nS, nI))
+    # Terminal cost: expected tail cost of infections still active at T
+    death_penalty = 1000.0 * alpha
+    tail_rate = gamma + mu
+    V = (alpha + death_penalty * mu) * I_grid / tail_rate
     t_remaining = T
 
     # Snapshot indices for free-boundary visualisation at t=T, T/2, 0
@@ -156,9 +161,9 @@ def solve_hjb(beta=BETA, gamma=GAMMA, alpha=ALPHA, T=T,
     for step in range(n_steps):
         dVdS, dVdI_bwd, dVdI_fwd = upwind_gradients(V, dS, dI)
         dVdI_central = 0.5 * (dVdI_bwd + dVdI_fwd)
-        u = optimal_control(S_grid, I_grid, dVdS, dVdI_central, beta)
+        u = optimal_control(S_grid, I_grid, dVdS, dVdI_central, beta, c_u=c_u)
         H = hamiltonian(S_grid, I_grid, dVdS, dVdI_bwd, dVdI_fwd, u,
-                        alpha, beta, gamma, mu=mu)
+                        alpha, beta, gamma, mu=mu, c_u=c_u)
 
         # Lax-Friedrichs artificial viscosity (Laplacian diffusion)
         lap = np.zeros_like(V)
@@ -183,9 +188,11 @@ def solve_hjb(beta=BETA, gamma=GAMMA, alpha=ALPHA, T=T,
 
     dVdS, dVdI_bwd, dVdI_fwd = upwind_gradients(V, dS, dI)
     dVdI_central = 0.5 * (dVdI_bwd + dVdI_fwd)
-    u_opt = optimal_control(S_grid, I_grid, dVdS, dVdI_central, beta)
+    u_opt = optimal_control(S_grid, I_grid, dVdS, dVdI_central, beta, c_u=c_u)
 
-    return s, i, V, u_opt, g_array, stopping_snapshots
+    stopped_frac = float(np.mean(np.isclose(V, g_array, rtol=1e-4, atol=1e-6)))
+
+    return s, i, V, u_opt, g_array, stopping_snapshots, stopped_frac
 
 
 # ---------------------------------------------------------------------------
@@ -238,15 +245,14 @@ def plot_results(s, i, V, u_opt, stopping_snapshots):
 
 if __name__ == "__main__":
     print(f"HJB solver: T={T}, grid={NS}x{NI}")
-    print(f"  beta={BETA}, gamma={GAMMA}, alpha={ALPHA}\n")
+    print(f"  beta={BETA}, gamma={GAMMA}, alpha={ALPHA}, c_u={C_U}\n")
 
-    s, i, V, u_opt, g_array, stopping_snapshots = solve_hjb()
+    s, i, V, u_opt, g_array, stopping_snapshots, stopped_frac = solve_hjb()
 
     print(f"\nDone. V range: [{V.min():.4f}, {V.max():.4f}]")
     print(f"g range: [{g_array.min():.4f}, {g_array.max():.4f}]")
     print(f"u* range: [{u_opt.min():.4f}, {u_opt.max():.4f}]")
-    stopped = np.mean(np.isclose(V, g_array, rtol=1e-4, atol=1e-6))
-    print(f"Stopping region at t=0: {stopped:.1%} of grid")
+    print(f"Stopping region at t=0: {stopped_frac:.1%} of grid")
 
     fig = plot_results(s, i, V, u_opt, stopping_snapshots)
     plt.show()
