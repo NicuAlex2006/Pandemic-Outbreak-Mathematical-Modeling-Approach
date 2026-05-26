@@ -6,12 +6,33 @@ Normalises against N_eff (cumulative wave cases) rather than the full
 range for the SIR solver and gradient-descent optimiser.
 """
 
+import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
 OWID_URL = "https://raw.githubusercontent.com/owid/covid-19-data/master/public/data/owid-covid-data.csv"
 INFECTIOUS_DAYS = 14
+_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".cache")
+_CACHE_FILE = os.path.join(_CACHE_DIR, "france_covid.csv")
+
+
+def _load_owid_france():
+    if os.path.exists(_CACHE_FILE):
+        return pd.read_csv(_CACHE_FILE, parse_dates=["date"])
+    import io, urllib.request
+    req = urllib.request.urlopen(OWID_URL, timeout=10)
+    df = pd.read_csv(
+        io.BytesIO(req.read()),
+        usecols=["iso_code", "date", "new_cases", "total_deaths"],
+        parse_dates=["date"],
+    )
+    df = df[df["iso_code"] == "FRA"].copy()
+    df = df[(df["date"] >= "2020-03-01") & (df["date"] <= "2020-06-30")]
+    df = df.sort_values("date").reset_index(drop=True)
+    os.makedirs(_CACHE_DIR, exist_ok=True)
+    df.to_csv(_CACHE_FILE, index=False)
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -26,14 +47,7 @@ def fetch_france_first_wave():
       - I_data  = active-case fraction normalised by N_eff
       - N_eff   = cumulative confirmed cases over the wave
     """
-    df = pd.read_csv(
-        OWID_URL,
-        usecols=["iso_code", "date", "new_cases"],
-        parse_dates=["date"],
-    )
-    df = df[df["iso_code"] == "FRA"].copy()
-    df = df[(df["date"] >= "2020-03-01") & (df["date"] <= "2020-06-30")]
-    df = df.sort_values("date").reset_index(drop=True)
+    df = _load_owid_france()
 
     df["new_cases"] = df["new_cases"].fillna(0)
     df["smoothed"] = df["new_cases"].rolling(window=7, min_periods=1).mean()
@@ -272,14 +286,7 @@ def fetch_france_data():
     Pull OWID data for France, 2020-03-01 to 2020-06-30.
     Returns (t, I_data, D_data, N_eff) where both are normalised fractions.
     """
-    df = pd.read_csv(
-        OWID_URL,
-        usecols=["iso_code", "date", "new_cases", "total_deaths"],
-        parse_dates=["date"],
-    )
-    df = df[df["iso_code"] == "FRA"].copy()
-    df = df[(df["date"] >= "2020-03-01") & (df["date"] <= "2020-06-30")]
-    df = df.sort_values("date").reset_index(drop=True)
+    df = _load_owid_france()
 
     df["new_cases"] = df["new_cases"].fillna(0)
     df["total_deaths"] = df["total_deaths"].ffill().fillna(0)

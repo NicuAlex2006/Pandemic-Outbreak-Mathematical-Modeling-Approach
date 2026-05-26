@@ -8,7 +8,7 @@ from simulation.agent import Agents, COMMUNITY_SIZE, QUARANTINE_RECT
 SIM_W = 900
 DASHBOARD_W = 550
 WINDOW_W = SIM_W + DASHBOARD_W
-WINDOW_H = 700
+WINDOW_H = 730
 TARGET_FPS = 30
 
 COLORS = {
@@ -112,6 +112,8 @@ class Renderer:
         self.running = False
         self.on_step = None
         self.on_restart = None
+        self._active_initial_infected = 5
+        self._restart_pending = False
 
         fitted_mu = dashboard.mu if dashboard else 0.003
 
@@ -120,26 +122,38 @@ class Renderer:
                                 color=(35, 55, 70), hover_color=(55, 85, 120),
                                 border_color=(70, 130, 180))
 
-        sw = 110
-        # Row 1
-        self.slider_alpha = Slider(20, 620, 170, 'alpha', 0.01, 5.0, 1.0)
-        self.slider_speed = Slider(210, 620, sw, 'speed', 1.0, 8.0, 2.0)
-        self.slider_mu = Slider(340, 620, sw, 'mu', 0.0, 0.05,
+        sw = 105
+        # Row 1: HJB cost coefficients
+        self.slider_alpha_i = Slider(20, 610, sw, 'αI', 0.1, 10.0, 1.0)
+        self.slider_alpha_d = Slider(140, 610, sw, 'αD', 100, 10000,
+                                      1000.0, fmt=".0f")
+        self.slider_i_cap = Slider(260, 610, sw, 'I_cap', 0.005, 0.10,
+                                    0.03, fmt=".3f")
+        self.slider_w_h = Slider(380, 610, sw, 'w_h', 10, 5000,
+                                  500.0, fmt=".0f")
+        # Row 2: epi + sim parameters
+        self.slider_speed = Slider(20, 640, sw, 'speed', 1.0, 8.0, 2.0)
+        self.slider_mu = Slider(140, 640, sw, 'mu', 0.0, 0.05,
                                  fitted_mu, fmt=".4f")
-        # Row 2
-        self.slider_inf_radius = Slider(20, 650, sw, 'inf_rad', 1, 15,
+        self.slider_inf_radius = Slider(260, 640, sw, 'inf_rad', 1, 15,
                                         BASE_INFECTION_RADIUS, fmt=".0f")
-        self.slider_jump_prob = Slider(150, 650, sw, 'jump_p', 0.0, 0.05,
+        self.slider_jump_prob = Slider(380, 640, sw, 'jump_p', 0.0, 0.05,
                                        BASE_JUMP_PROB, fmt=".4f")
-        self.slider_q_delay = Slider(280, 650, sw, 'q_delay', 0.5, 10.0,
+        # Row 3: remaining
+        self.slider_q_delay = Slider(20, 670, sw, 'q_delay', 0.5, 10.0,
                                       BASE_QUARANTINE_DELAY, fmt=".1f")
-        self.slider_omega = Slider(410, 650, sw, 'omega', 0.0, 0.1,
+        self.slider_omega = Slider(140, 670, sw, 'omega', 0.0, 0.1,
                                     0.0, fmt=".4f")
+        self.slider_initial_inf = Slider(260, 670, sw, 'init_I', 1, 500,
+                                          5, fmt=".0f")
 
         self._all_sliders = [
-            self.slider_alpha, self.slider_speed, self.slider_mu,
+            self.slider_alpha_i, self.slider_alpha_d,
+            self.slider_i_cap, self.slider_w_h,
+            self.slider_speed, self.slider_mu,
             self.slider_inf_radius, self.slider_jump_prob,
             self.slider_q_delay, self.slider_omega,
+            self.slider_initial_inf,
         ]
 
     def setup(self):
@@ -163,6 +177,10 @@ class Renderer:
         self.dashboard.gamma_eff = self.dashboard.gamma * q_ratio
         self.dashboard.omega = self.slider_omega.value
         self.dashboard.mu = self.slider_mu.value
+        self.dashboard.alpha_i = self.slider_alpha_i.value
+        self.dashboard.alpha_d = self.slider_alpha_d.value
+        self.dashboard.i_cap = self.slider_i_cap.value
+        self.dashboard.w_h = self.slider_w_h.value
 
         with self.state["lock"]:
             self.state["omega"] = self.slider_omega.value
@@ -173,10 +191,13 @@ class Renderer:
             return
         self._compute_effective_rates()
         self.dashboard.request_solve(
-            self.slider_alpha.value,
+            self.slider_alpha_i.value,
+            self.slider_alpha_d.value,
             self.dashboard.beta_eff,
             self.dashboard.gamma_eff,
             self.dashboard.mu,
+            self.slider_i_cap.value,
+            self.slider_w_h.value,
         )
 
     def run(self):
@@ -223,6 +244,16 @@ class Renderer:
         self.draw_agents()
         self.draw_hud()
         self.draw_sliders()
+        if self._restart_pending:
+            self.btn_restart.color = (120, 100, 20)
+            self.btn_restart.hover_color = (180, 150, 30)
+            self.btn_restart.border_color = (255, 200, 50)
+            self.btn_restart.label = 'RESTART *'
+        else:
+            self.btn_restart.color = (70, 35, 35)
+            self.btn_restart.hover_color = (120, 55, 55)
+            self.btn_restart.border_color = (180, 70, 70)
+            self.btn_restart.label = 'RESTART'
         self.btn_restart.draw(self.screen, self.font_small)
         self.btn_pause.draw(self.screen, self.font_small)
         if self.dashboard:
@@ -316,12 +347,26 @@ class Renderer:
         elif s is self.slider_omega:
             with self.state["lock"]:
                 self.state["omega"] = s.value
-        elif s is self.slider_alpha:
+        elif s is self.slider_alpha_i:
             with self.state["lock"]:
-                self.state["alpha"] = s.value
+                self.state["alpha_i"] = s.value
+        elif s is self.slider_alpha_d:
+            with self.state["lock"]:
+                self.state["alpha_d"] = s.value
+        elif s is self.slider_i_cap:
+            with self.state["lock"]:
+                self.state["i_cap"] = s.value
+        elif s is self.slider_w_h:
+            with self.state["lock"]:
+                self.state["w_h"] = s.value
         elif s is self.slider_mu:
             with self.state["lock"]:
                 self.state["mu_fit"] = s.value
+        elif s is self.slider_initial_inf:
+            self._restart_pending = (int(s.value) != self._active_initial_infected)
+            with self.state["lock"]:
+                self.state["initial_infected_pending"] = int(s.value)
+            return
 
         self._trigger_resolve()
 
@@ -331,9 +376,14 @@ class Renderer:
             self.btn_pause.label = 'PLAY' if self.dashboard.paused else 'PAUSE'
 
     def _restart(self):
-        self.world.agents.initialize(self.world.community_centers)
+        n_inf = int(self.slider_initial_inf.value)
+        self.world.agents.initialize(self.world.community_centers,
+                                     n_initial_infected=n_inf)
+        self._active_initial_infected = n_inf
+        self._restart_pending = False
         self.world.t_days = 0.0
         self.world.u_current = 0.0
+        i0 = n_inf / self.world.agents.n
         with self.state['lock']:
             self.state['S_history'].clear()
             self.state['I_history'].clear()
@@ -342,7 +392,11 @@ class Renderer:
             self.state['t_history'].clear()
             self.state['t_days'] = 0.0
             self.state['u_current'] = 0.0
+            self.state['I0'] = i0
+            self.state['S0'] = 1.0 - i0
         if self.dashboard:
+            self.dashboard.I0 = i0
+            self.dashboard.S0 = 1.0 - i0
             self.dashboard.reset_tracking()
         if self.on_restart:
             self.on_restart()

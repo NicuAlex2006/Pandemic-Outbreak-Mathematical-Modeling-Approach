@@ -17,9 +17,12 @@ from models.adapter import (solve_hjb, solve_binomial_stopping,
                             fit_sird, fetch_france_data)
 
 T_SIM = 365.0
-ALPHA_DEFAULT = 1.0
-S0_DEFAULT = 0.99
-I0_DEFAULT = 0.01
+ALPHA_I_DEFAULT = 1.0
+ALPHA_D_DEFAULT = 1000.0
+I_CAP_DEFAULT = 0.03
+W_H_DEFAULT = 500.0
+S0_DEFAULT = 0.80
+I0_DEFAULT = 0.20
 
 
 def main():
@@ -48,7 +51,8 @@ def main():
 
     print("=== Startup: initial HJB solve ===")
     V, u_opt, S_grid, I_grid, g_array, stopped_frac = solve_hjb(
-        beta, gamma, ALPHA_DEFAULT, T=T_SIM, mu=mu,
+        beta, gamma, ALPHA_I_DEFAULT, alpha_d=ALPHA_D_DEFAULT,
+        T=T_SIM, mu=mu, i_cap=I_CAP_DEFAULT, w_h=W_H_DEFAULT,
     )
     print(f"  V range: [{V.min():.3f}, {V.max():.3f}]  u_opt: {u_opt.shape}")
     print(f"  Stopping: {'Yes' if stopped_frac > 0.01 else 'No'} ({stopped_frac:.1%})")
@@ -58,13 +62,20 @@ def main():
     print(f"  Nodes: {len(stop_tree)}")
     print("=== Startup complete ===\n")
 
+    from simulation.agent import N as N_AGENTS
+    n_initial_infected = 5
+    I0_sim = n_initial_infected / N_AGENTS
+    S0_sim = 1.0 - I0_sim
+
     shared_state = {
         "S_history": [], "I_history": [], "R_history": [],
         "D_history": [], "t_history": [],
         "t_days": 0.0, "u_current": 0.0,
         "beta_fit": beta, "gamma_fit": gamma, "mu_fit": mu,
         "u_opt": u_opt, "S_grid": S_grid, "I_grid": I_grid,
-        "alpha": ALPHA_DEFAULT, "omega": 0.0,
+        "alpha_i": ALPHA_I_DEFAULT, "alpha_d": ALPHA_D_DEFAULT,
+        "i_cap": I_CAP_DEFAULT, "w_h": W_H_DEFAULT,
+        "omega": 0.0, "I0": I0_sim, "S0": S0_sim,
         "lock": threading.Lock(), "hjb_running": False,
     }
 
@@ -72,8 +83,9 @@ def main():
         beta=beta, gamma=gamma, mu=mu,
         V=V, u_opt=u_opt, g_array=g_array,
         S_grid=S_grid, I_grid=I_grid,
-        alpha=ALPHA_DEFAULT, T=T_SIM,
-        stopped_frac=stopped_frac,
+        alpha_i=ALPHA_I_DEFAULT, alpha_d=ALPHA_D_DEFAULT,
+        i_cap=I_CAP_DEFAULT, w_h=W_H_DEFAULT,
+        T=T_SIM, stopped_frac=stopped_frac,
     )
 
     world = World(shared_state=shared_state)

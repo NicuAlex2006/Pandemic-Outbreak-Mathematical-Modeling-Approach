@@ -26,7 +26,7 @@ REFRESH_INTERVAL = 0.5
 class Dashboard:
 
     def __init__(self, beta, gamma, mu, V, u_opt, g_array, S_grid, I_grid,
-                 alpha, T, stopped_frac=0.0):
+                 alpha_i, alpha_d, i_cap, w_h, T, stopped_frac=0.0):
         self.beta = beta
         self.gamma = gamma
         self.mu = mu
@@ -36,9 +36,14 @@ class Dashboard:
         self.g_array = g_array
         self.S_grid = S_grid
         self.I_grid = I_grid
-        self.alpha = alpha
+        self.alpha_i = alpha_i
+        self.alpha_d = alpha_d
+        self.i_cap = i_cap
+        self.w_h = w_h
         self.T = T
         self.stopping = stopped_frac > 0.01
+        self.I0 = 5 / 8000.0
+        self.S0 = 1.0 - self.I0
 
         self.beta_eff = beta
         self.gamma_eff = gamma
@@ -80,27 +85,30 @@ class Dashboard:
             req = self.solve_request_q.get()
             if req is None:
                 return
-            alpha, beta_eff, gamma_eff, mu = req
-            self._worker_status = f"solving α={alpha:.2f}"
+            alpha_i, alpha_d, beta_eff, gamma_eff, mu, i_cap, w_h = req
+            self._worker_status = f"solving αI={alpha_i:.1f} αD={alpha_d:.0f}"
             t0 = time.monotonic()
             try:
                 V_new, u_new, S_g, I_g, g_new, stopped_frac = solve_hjb(
-                    beta_eff, gamma_eff, alpha, T=self.T, mu=mu,
+                    beta_eff, gamma_eff, alpha_i, alpha_d=alpha_d,
+                    T=self.T, mu=mu, i_cap=i_cap, w_h=w_h,
                 )
                 dur = time.monotonic() - t0
-                self.solve_result_q.put((alpha, beta_eff, gamma_eff,
+                self.solve_result_q.put((alpha_i, alpha_d, beta_eff, gamma_eff,
                                          V_new, u_new, S_g, I_g, g_new,
                                          stopped_frac, dur))
             except Exception as e:
                 self.solve_result_q.put(("error", e))
             self._worker_status = "idle"
 
-    def request_solve(self, alpha, beta_eff, gamma_eff, mu):
+    def request_solve(self, alpha_i, alpha_d, beta_eff, gamma_eff, mu,
+                      i_cap, w_h):
         try:
             self.solve_request_q.get_nowait()
         except queue.Empty:
             pass
-        self.solve_request_q.put_nowait((alpha, beta_eff, gamma_eff, mu))
+        self.solve_request_q.put_nowait((alpha_i, alpha_d, beta_eff, gamma_eff,
+                                         mu, i_cap, w_h))
 
     def poll_worker(self):
         try:
@@ -108,10 +116,11 @@ class Dashboard:
             if result[0] == "error":
                 self._worker_status = f"error: {result[1]}"
                 return
-            (alpha_done, beta_eff, gamma_eff,
+            (alpha_i_done, alpha_d_done, beta_eff, gamma_eff,
              V_new, u_new, S_g, I_g, g_new,
              stopped_frac, dur) = result
-            self.alpha = alpha_done
+            self.alpha_i = alpha_i_done
+            self.alpha_d = alpha_d_done
             self.beta_eff = beta_eff
             self.gamma_eff = gamma_eff
             self.V = V_new
@@ -190,18 +199,21 @@ class Dashboard:
             n_pts = min(200, len(t))
             S_f, I_f, R_f, D_f, t_f = sirds_euler(
                 self.beta_eff, self.gamma_eff, self.mu,
-                S[0], I[0], t_arr[-1], n_pts, omega=self.omega)
+                self.S0, self.I0, t_arr[-1], n_pts, omega=self.omega)
             ax.plot(t_f, S_f, "b--", lw=0.5, alpha=0.4)
             ax.plot(t_f, I_f, "r--", lw=0.5, alpha=0.4)
             ax.plot(t_f, R_f, "g--", lw=0.5, alpha=0.4)
             ax.plot(t_f, D_f, "k--", lw=0.5, alpha=0.4)
+
+        ax.axvline(0, color='#00CC66', lw=0.8, ls='--', alpha=0.5)
 
         ax.set_ylim(0, 1)
         ax.set_xlabel("t (days)", fontsize=7)
         ax.set_ylabel("fraction", fontsize=7)
         ax.set_title(f"SIRD-S  " + r"$\beta$" + f"*={self.beta_eff:.3f}  "
                      + r"$\gamma$" + f"*={self.gamma_eff:.3f}  "
-                     + r"$\mu$" + f"={self.mu:.4f}", fontsize=7)
+                     + r"$\mu$" + f"={self.mu:.4f}"
+                     + f"  I0={self.I0:.4f}", fontsize=7)
         ax.legend(fontsize=5, loc="right")
         ax.tick_params(labelsize=6)
 
@@ -224,6 +236,9 @@ class Dashboard:
         ax.contour(i_c, s_c, stop_mask.astype(float),
                    levels=[0.5], colors=["#cc0000"], linewidths=1.0)
 
+        ax.plot(self.I0, self.S0, marker='*', color='#00CC66',
+                ms=10, mec='white', mew=0.5, zorder=5)
+
         if len(self._phase_S) > 1:
             ax.plot(self._phase_I, self._phase_S, "k-", lw=0.5, alpha=0.4)
             ax.plot(self._phase_I[-1], self._phase_S[-1], "ro", ms=5)
@@ -232,7 +247,7 @@ class Dashboard:
         ax.set_ylim(0, 1)
         ax.set_xlabel("I", fontsize=7)
         ax.set_ylabel("S", fontsize=7)
-        ax.set_title(f"HJB Free Boundary  α={self.alpha:.2f}", fontsize=8)
+        ax.set_title(f"HJB Free Boundary  αI={self.alpha_i:.1f} αD={self.alpha_d:.0f}", fontsize=8)
         ax.tick_params(labelsize=6)
 
     # --- Debug panel --------------------------------------------------------
@@ -272,8 +287,14 @@ class Dashboard:
             f"R0eff = {R0eff:.2f}",
             f"Stopping: {stopping_str}",
             "",
+            "── Cost ──",
+            f"αI    = {self.alpha_i:.2f}",
+            f"αD    = {self.alpha_d:.0f}",
+            f"I_cap = {self.i_cap:.3f}",
+            f"w_h   = {self.w_h:.0f}",
+            f"I0    = {self.I0:.4f}",
+            "",
             "── Params ──",
-            f"α     = {self.alpha:.2f}",
             f"β     = {self.beta:.4f}",
             f"γ     = {self.gamma:.4f}",
             f"mu    = {self.mu:.5f}",

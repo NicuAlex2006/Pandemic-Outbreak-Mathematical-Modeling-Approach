@@ -1,7 +1,10 @@
 """
 Hamilton-Jacobi-Bellman solver for optimal control of the SIR epidemic model.
 
-Minimises J = integral_0^T [ alpha * I(t) + (c_u/2) * u(t)^2 ] dt
+Minimises J = integral_0^T L(I, u, t) dt  where
+
+  L = alpha_I * I + alpha_D * mu * I + w_h * max(0, I - I_cap)^2 + (c_u/2) * u^2
+
 subject to:
     dS/dt = -beta * (1 - u) * S * I
     dI/dt =  beta * (1 - u) * S * I - gamma * I
@@ -27,13 +30,16 @@ import matplotlib.pyplot as plt
 BETA = 0.4
 GAMMA = 0.1
 MU = 0.005           # mortality rate
-ALPHA = 1.0          # weight on infection cost
-C_U = 0.01           # control cost coefficient (was 0.5)
+ALPHA_I = 1.0        # infection cost weight
+ALPHA_D = 1000.0     # death cost weight
+C_U = 0.01           # control cost coefficient
+I_CAP = 0.03         # hospital capacity threshold (fraction of population)
+W_HOSPITAL = 500.0   # hospital overflow penalty weight
 T = 10.0             # time horizon
 NS = 51              # grid points in S direction
 NI = 51              # grid points in I direction
 CFL_SAFETY = 0.4     # fraction of CFL limit
-LF_VISCOSITY = 0.12  # Lax-Friedrichs viscosity scaling (was 0.5)
+LF_VISCOSITY = 0.12  # Lax-Friedrichs viscosity scaling
 
 
 # ---------------------------------------------------------------------------
@@ -75,12 +81,19 @@ def upwind_gradients(V, dS, dI):
 # ---------------------------------------------------------------------------
 
 def optimal_control(S_grid, I_grid, dVdS, dVdI, beta, c_u=C_U):
-    u_star = beta * S_grid * I_grid * (dVdI - dVdS) / c_u
+    grad_diff = np.clip(dVdI - dVdS, -1e6, 1e6)
+    u_star = beta * S_grid * I_grid * grad_diff / c_u
     return np.clip(u_star, 0.0, 1.0)
 
 
+def _hospital_penalty(I_grid, i_cap, w_h):
+    overflow = np.maximum(0.0, I_grid - i_cap)
+    return w_h * overflow * overflow
+
+
 def hamiltonian(S_grid, I_grid, dVdS, dVdI_bwd, dVdI_fwd, u,
-                alpha, beta, gamma, mu=0.0, c_u=C_U):
+                alpha_i, alpha_d, beta, gamma, mu=0.0, c_u=C_U,
+                i_cap=I_CAP, w_h=W_HOSPITAL):
     infection = beta * (1.0 - u) * S_grid * I_grid
     drift_S = -infection
     drift_I = infection - gamma * I_grid - mu * I_grid
@@ -88,8 +101,10 @@ def hamiltonian(S_grid, I_grid, dVdS, dVdI_bwd, dVdI_fwd, u,
     drift_I_pos = np.maximum(drift_I, 0.0)
     drift_I_neg = np.minimum(drift_I, 0.0)
 
-    death_penalty = 1000.0 * alpha
-    running_cost = alpha * I_grid + death_penalty * mu * I_grid + (c_u / 2.0) * u**2
+    running_cost = (alpha_i * I_grid
+                    + alpha_d * mu * I_grid
+                    + _hospital_penalty(I_grid, i_cap, w_h)
+                    + (c_u / 2.0) * u**2)
     return (running_cost
             + dVdS * drift_S
             + dVdI_bwd * drift_I_pos
@@ -100,19 +115,20 @@ def hamiltonian(S_grid, I_grid, dVdS, dVdI_bwd, dVdI_fwd, u,
 # Do-nothing (uncontrolled) cost g(s, i) — vectorised forward Euler
 # ---------------------------------------------------------------------------
 
-def compute_do_nothing_cost(S_grid, I_grid, beta, gamma, alpha, T,
-                            mu=0.0, n_fwd=2000):
+def compute_do_nothing_cost(S_grid, I_grid, beta, gamma, alpha_i, alpha_d, T,
+                            mu=0.0, i_cap=I_CAP, w_h=W_HOSPITAL, n_fwd=2000):
     dt_fwd = T / n_fwd
     S_fwd = S_grid.copy()
     I_fwd = I_grid.copy()
     g_array = np.zeros_like(S_grid)
 
-    death_penalty = 1000.0 * alpha
     for _ in range(n_fwd):
         infection = beta * S_fwd * I_fwd
         dS = -infection
         dI = infection - gamma * I_fwd - mu * I_fwd
-        g_array += (alpha * I_fwd + death_penalty * mu * I_fwd) * dt_fwd
+        g_array += (alpha_i * I_fwd
+                    + alpha_d * mu * I_fwd
+                    + _hospital_penalty(I_fwd, i_cap, w_h)) * dt_fwd
         S_fwd = np.clip(S_fwd + dS * dt_fwd, 0.0, 1.0)
         I_fwd = np.clip(I_fwd + dI * dt_fwd, 0.0, 1.0)
 
@@ -123,8 +139,9 @@ def compute_do_nothing_cost(S_grid, I_grid, beta, gamma, alpha, T,
 # Backward induction with optimal stopping (variational inequality)
 # ---------------------------------------------------------------------------
 
-def solve_hjb(beta=BETA, gamma=GAMMA, alpha=ALPHA, T=T,
-              nS=NS, nI=NI, mu=MU, c_u=C_U):
+def solve_hjb(beta=BETA, gamma=GAMMA, alpha_i=ALPHA_I, alpha_d=ALPHA_D,
+              T=T, nS=NS, nI=NI, mu=MU, c_u=C_U,
+              i_cap=I_CAP, w_h=W_HOSPITAL):
     s, i, dS, dI, S_grid, I_grid = build_grid(nS, nI)
 
     max_speed = beta + gamma + mu
@@ -132,25 +149,22 @@ def solve_hjb(beta=BETA, gamma=GAMMA, alpha=ALPHA, T=T,
     n_steps = int(np.ceil(T / dt))
     dt = T / n_steps
 
-    # Lax-Friedrichs viscosity coefficients (reduced to preserve gradients)
     nu_S = LF_VISCOSITY * dS * max_speed
     nu_I = LF_VISCOSITY * dI * max_speed
 
     print(f"  dt = {dt:.6f}, n_steps = {n_steps}")
 
-    # Precompute the do-nothing obstacle
     print("  Computing do-nothing cost g(s, i)...")
-    g_array = compute_do_nothing_cost(S_grid, I_grid, beta, gamma, alpha, T,
-                                       mu=mu)
-    print(f"  g range: [{g_array.min():.4f}, {g_array.max():.4f}]")
+    g_array = compute_do_nothing_cost(S_grid, I_grid, beta, gamma,
+                                       alpha_i, alpha_d, T, mu=mu,
+                                       i_cap=i_cap, w_h=w_h)
+    g_max = float(g_array.max())
+    print(f"  g range: [{g_array.min():.4f}, {g_max:.4f}]")
 
-    # Terminal cost: expected tail cost of infections still active at T
-    death_penalty = 1000.0 * alpha
     tail_rate = gamma + mu
-    V = (alpha + death_penalty * mu) * I_grid / tail_rate
+    V = (alpha_i + alpha_d * mu) * I_grid / tail_rate
     t_remaining = T
 
-    # Snapshot indices for free-boundary visualisation at t=T, T/2, 0
     snap_steps = {
         0: "T",
         n_steps // 2: "T/2",
@@ -163,16 +177,18 @@ def solve_hjb(beta=BETA, gamma=GAMMA, alpha=ALPHA, T=T,
         dVdI_central = 0.5 * (dVdI_bwd + dVdI_fwd)
         u = optimal_control(S_grid, I_grid, dVdS, dVdI_central, beta, c_u=c_u)
         H = hamiltonian(S_grid, I_grid, dVdS, dVdI_bwd, dVdI_fwd, u,
-                        alpha, beta, gamma, mu=mu, c_u=c_u)
+                        alpha_i, alpha_d, beta, gamma, mu=mu, c_u=c_u,
+                        i_cap=i_cap, w_h=w_h)
 
-        # Lax-Friedrichs artificial viscosity (Laplacian diffusion)
         lap = np.zeros_like(V)
         lap[1:-1, :] += nu_S * (V[2:, :] - 2*V[1:-1, :] + V[:-2, :]) / dS**2
         lap[:, 1:-1] += nu_I * (V[:, 2:] - 2*V[:, 1:-1] + V[:, :-2]) / dI**2
 
         V = V + dt * (H + lap)
 
-        # Variational inequality: enforce obstacle constraint
+        np.clip(V, 0.0, g_max, out=V)
+        np.nan_to_num(V, copy=False, nan=0.0, posinf=g_max, neginf=0.0)
+
         V = np.minimum(V, g_array)
 
         t_remaining -= dt
@@ -245,7 +261,8 @@ def plot_results(s, i, V, u_opt, stopping_snapshots):
 
 if __name__ == "__main__":
     print(f"HJB solver: T={T}, grid={NS}x{NI}")
-    print(f"  beta={BETA}, gamma={GAMMA}, alpha={ALPHA}, c_u={C_U}\n")
+    print(f"  beta={BETA}, gamma={GAMMA}, alpha_i={ALPHA_I}, alpha_d={ALPHA_D}, c_u={C_U}")
+    print(f"  i_cap={I_CAP}, w_h={W_HOSPITAL}\n")
 
     s, i, V, u_opt, g_array, stopping_snapshots, stopped_frac = solve_hjb()
 
