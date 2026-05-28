@@ -17,10 +17,8 @@ from models.adapter import (solve_hjb, solve_binomial_stopping,
                             fit_sird, fetch_france_data)
 
 T_SIM = 365.0
-ALPHA_I_DEFAULT = 1.0
-ALPHA_D_DEFAULT = 1000.0
-I_CAP_DEFAULT = 0.03
-W_H_DEFAULT = 500.0
+CARE_DEFAULT = 0.5
+URGENCY_DEFAULT = 0.5
 S0_DEFAULT = 0.80
 I0_DEFAULT = 0.20
 
@@ -51,8 +49,7 @@ def main():
 
     print("=== Startup: initial HJB solve ===")
     V, u_opt, S_grid, I_grid, g_array, stopped_frac = solve_hjb(
-        beta, gamma, ALPHA_I_DEFAULT, alpha_d=ALPHA_D_DEFAULT,
-        T=T_SIM, mu=mu, i_cap=I_CAP_DEFAULT, w_h=W_H_DEFAULT,
+        beta, gamma, care=CARE_DEFAULT, T=T_SIM, mu=mu,
     )
     print(f"  V range: [{V.min():.3f}, {V.max():.3f}]  u_opt: {u_opt.shape}")
     print(f"  Stopping: {'Yes' if stopped_frac > 0.01 else 'No'} ({stopped_frac:.1%})")
@@ -73,8 +70,8 @@ def main():
         "t_days": 0.0, "u_current": 0.0,
         "beta_fit": beta, "gamma_fit": gamma, "mu_fit": mu,
         "u_opt": u_opt, "S_grid": S_grid, "I_grid": I_grid,
-        "alpha_i": ALPHA_I_DEFAULT, "alpha_d": ALPHA_D_DEFAULT,
-        "i_cap": I_CAP_DEFAULT, "w_h": W_H_DEFAULT,
+        "care": CARE_DEFAULT, "urgency": URGENCY_DEFAULT,
+        "p_enact": CARE_DEFAULT * URGENCY_DEFAULT,
         "omega": 0.0, "I0": I0_sim, "S0": S0_sim,
         "lock": threading.Lock(), "hjb_running": False,
     }
@@ -83,8 +80,7 @@ def main():
         beta=beta, gamma=gamma, mu=mu,
         V=V, u_opt=u_opt, g_array=g_array,
         S_grid=S_grid, I_grid=I_grid,
-        alpha_i=ALPHA_I_DEFAULT, alpha_d=ALPHA_D_DEFAULT,
-        i_cap=I_CAP_DEFAULT, w_h=W_H_DEFAULT,
+        care=CARE_DEFAULT, urgency=URGENCY_DEFAULT,
         T=T_SIM, stopped_frac=stopped_frac,
     )
 

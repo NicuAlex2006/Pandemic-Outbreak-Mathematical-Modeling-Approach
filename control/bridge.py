@@ -8,7 +8,7 @@ class ControlBridge:
     Applies exponential moving average to avoid abrupt policy jumps.
     """
 
-    def __init__(self, ema_alpha: float = 0.1):
+    def __init__(self, ema_alpha: float = 0.25):
         self.ema_alpha = ema_alpha      # smoothing factor ∈ (0, 1]
         self.u_smooth: float = 0.0     # current smoothed control value
 

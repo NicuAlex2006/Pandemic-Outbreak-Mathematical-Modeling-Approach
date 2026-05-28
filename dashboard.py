@@ -26,7 +26,7 @@ REFRESH_INTERVAL = 0.5
 class Dashboard:
 
     def __init__(self, beta, gamma, mu, V, u_opt, g_array, S_grid, I_grid,
-                 alpha_i, alpha_d, i_cap, w_h, T, stopped_frac=0.0):
+                 care, urgency, T, stopped_frac=0.0):
         self.beta = beta
         self.gamma = gamma
         self.mu = mu
@@ -36,10 +36,8 @@ class Dashboard:
         self.g_array = g_array
         self.S_grid = S_grid
         self.I_grid = I_grid
-        self.alpha_i = alpha_i
-        self.alpha_d = alpha_d
-        self.i_cap = i_cap
-        self.w_h = w_h
+        self.care = care
+        self.urgency = urgency
         self.T = T
         self.stopping = stopped_frac > 0.01
         self.I0 = 5 / 8000.0
@@ -85,30 +83,28 @@ class Dashboard:
             req = self.solve_request_q.get()
             if req is None:
                 return
-            alpha_i, alpha_d, beta_eff, gamma_eff, mu, i_cap, w_h = req
-            self._worker_status = f"solving αI={alpha_i:.1f} αD={alpha_d:.0f}"
+            care, beta_eff, gamma_eff, mu = req
+            self._worker_status = f"solving care={care:.2f}"
             t0 = time.monotonic()
             try:
                 V_new, u_new, S_g, I_g, g_new, stopped_frac = solve_hjb(
-                    beta_eff, gamma_eff, alpha_i, alpha_d=alpha_d,
-                    T=self.T, mu=mu, i_cap=i_cap, w_h=w_h,
+                    beta_eff, gamma_eff, care=care,
+                    T=self.T, mu=mu,
                 )
                 dur = time.monotonic() - t0
-                self.solve_result_q.put((alpha_i, alpha_d, beta_eff, gamma_eff,
+                self.solve_result_q.put((care, beta_eff, gamma_eff,
                                          V_new, u_new, S_g, I_g, g_new,
                                          stopped_frac, dur))
             except Exception as e:
                 self.solve_result_q.put(("error", e))
             self._worker_status = "idle"
 
-    def request_solve(self, alpha_i, alpha_d, beta_eff, gamma_eff, mu,
-                      i_cap, w_h):
+    def request_solve(self, care, beta_eff, gamma_eff, mu):
         try:
             self.solve_request_q.get_nowait()
         except queue.Empty:
             pass
-        self.solve_request_q.put_nowait((alpha_i, alpha_d, beta_eff, gamma_eff,
-                                         mu, i_cap, w_h))
+        self.solve_request_q.put_nowait((care, beta_eff, gamma_eff, mu))
 
     def poll_worker(self):
         try:
@@ -116,11 +112,10 @@ class Dashboard:
             if result[0] == "error":
                 self._worker_status = f"error: {result[1]}"
                 return
-            (alpha_i_done, alpha_d_done, beta_eff, gamma_eff,
+            (care_done, beta_eff, gamma_eff,
              V_new, u_new, S_g, I_g, g_new,
              stopped_frac, dur) = result
-            self.alpha_i = alpha_i_done
-            self.alpha_d = alpha_d_done
+            self.care = care_done
             self.beta_eff = beta_eff
             self.gamma_eff = gamma_eff
             self.V = V_new
@@ -247,7 +242,7 @@ class Dashboard:
         ax.set_ylim(0, 1)
         ax.set_xlabel("I", fontsize=7)
         ax.set_ylabel("S", fontsize=7)
-        ax.set_title(f"HJB Free Boundary  αI={self.alpha_i:.1f} αD={self.alpha_d:.0f}", fontsize=8)
+        ax.set_title(f"HJB Free Boundary  care={self.care:.2f} urg={self.urgency:.2f}", fontsize=8)
         ax.tick_params(labelsize=6)
 
     # --- Debug panel --------------------------------------------------------
@@ -287,12 +282,11 @@ class Dashboard:
             f"R0eff = {R0eff:.2f}",
             f"Stopping: {stopping_str}",
             "",
-            "── Cost ──",
-            f"αI    = {self.alpha_i:.2f}",
-            f"αD    = {self.alpha_d:.0f}",
-            f"I_cap = {self.i_cap:.3f}",
-            f"w_h   = {self.w_h:.0f}",
-            f"I0    = {self.I0:.4f}",
+            "── Policy ──",
+            f"care    = {self.care:.2f}",
+            f"urgency = {self.urgency:.2f}",
+            f"p_enact = {max(0.02, self.urgency*self.care):.2f}",
+            f"I0      = {self.I0:.4f}",
             "",
             "── Params ──",
             f"β     = {self.beta:.4f}",
