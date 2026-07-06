@@ -1,184 +1,178 @@
-import math
+"""
+World — advances a playhead along the optimal ODE trajectory and relabels the
+agent population so the on-screen S/I/Q/R/D counts match it exactly.
+
+The epidemic lives entirely in the ODE; the agents are a faithful particle
+rendering of it (mass is conserved, so counts always reconcile).
+"""
+
 import numpy as np
-import simulation.agent as _agent
+
 from simulation.agent import (
-    Agents, N, N_COMMUNITIES, COMMUNITY_SIZE, COMMUNITY_AREA, COMMUNITY_PADDING,
-    BETA_SIM, GAMMA_SIM, MOVE_SPEED, DT,
-    QUARANTINE_RECT,
+    Agents, N_COMMUNITIES, COMMUNITY_SIZE, QUARANTINE_RECT, MOVE_SPEED,
 )
 
 
+def _round_counts(fracs, N: int) -> np.ndarray:
+    """Largest-remainder rounding so integer counts sum exactly to N."""
+    raw = np.asarray(fracs, dtype=float) * N
+    base = np.floor(raw).astype(int)
+    deficit = N - int(base.sum())
+    if deficit != 0:
+        rem = raw - base
+        order = np.argsort(-rem) if deficit > 0 else np.argsort(rem)
+        base[order[:abs(deficit)]] += np.sign(deficit)
+    return base
+
+
 class World:
-    """
-    Owns the agent arrays and advances the simulation one timestep at a time.
-    Writes aggregate S/I/R history into shared_state (thread-safe via lock).
-    """
-
-    def __init__(self, shared_state: dict):
+    def __init__(self, shared_state: dict | None = None):
         self.agents = Agents()
-        self.state = shared_state
-        self.t_days: float = 0.0
-        self.u_current: float = 0.0
-        self.community_centers: np.ndarray = None  # (N_COMMUNITIES, 2) float32
+        self.state = shared_state or {}
+        self.centers = None
+        self.trajectory = None
+        self.t_days = 0.0
+        self.u_L = 0.0
+        self.u_Q = 0.0
 
-    def setup(self):
-        # Rectangular layout, communities laid out in a grid inside the community area.
-        # COMMUNITY_AREA[2] is the number of rows.
-        # Keeps all communities away from the quarantine zone (bottom-right).
-        centers = []
-        rows = COMMUNITY_AREA[2]
-        for i in range(N_COMMUNITIES):
-            row = i % rows
-            column = i // rows
-            centers.append([COMMUNITY_AREA[0] + column * (COMMUNITY_PADDING[0] + COMMUNITY_SIZE[0]),
-                            COMMUNITY_AREA[1] + row * (COMMUNITY_PADDING[1] + COMMUNITY_SIZE[1])])
-        self.community_centers = np.array(centers, dtype=np.float32)
-        self.agents.initialize(self.community_centers)
+    # --- setup ----------------------------------------------------------------
 
-    # --- main step --------------------------------------------------------
+    def setup(self, n_initial_infected: int = 8):
+        self.centers = self.agents.community_centers()
+        self.agents.initialize(self.centers, n_initial_infected)
 
-    def step(self):
+    def reset(self, n_initial_infected: int = 8):
+        self.agents.initialize(self.centers, n_initial_infected)
+        self.t_days = 0.0
+        self.u_L = self.u_Q = 0.0
+
+    def set_trajectory(self, traj, reset_playhead: bool = False):
+        self.trajectory = traj
+        if reset_playhead:
+            self.t_days = 0.0
+
+    def finished(self) -> bool:
+        return self.trajectory is not None and self.t_days >= self.trajectory.t[-1]
+
+    # --- main step ------------------------------------------------------------
+
+    def step(self, dt_days: float):
+        if self.trajectory is None:
+            return None
+        self.t_days = min(self.t_days + dt_days, self.trajectory.t[-1])
+        smp = self.trajectory.at(self.t_days)
+        self.u_L, self.u_Q = smp["u_L"], smp["u_Q"]
+
+        targets = _round_counts(
+            [smp["S"], smp["I"], smp["Q"], smp["R"], smp["D"]], self.agents.n)
+        self._reconcile(targets)
+        self._age(dt_days)
+        self._animate(smp["u_L"])
+        return smp
+
+    # --- reconciliation (relabel agents to hit target counts) ----------------
+
+    def _reconcile(self, targets):
         a = self.agents
-        active = (a.statuses == Agents.I) | (a.statuses == Agents.Q)
-        a.days_infected[active] += DT
+        s = a.statuses
+        nS, nI, nQ, nR, nD = (int(x) for x in targets)
+        A = Agents
 
-        self._move()
-        self._jump()
-        self._infect()
-        self._quarantine()
-        self._die()
-        self._recover()
-        self._lose_immunity()
-        self._aggregate()
-        self.t_days += DT
+        # 1. deaths (absorbing) — drawn from the infectious pool, oldest first
+        need = nD - int((s == A.D).sum())
+        if need > 0:
+            self._resolve_oldest((s == A.I) | (s == A.Q), need, A.D)
 
-    # --- sub-steps --------------------------------------------------------
+        # 2. recoveries (absorbing) — likewise
+        need = nR - int((s == A.R).sum())
+        if need > 0:
+            self._resolve_oldest((s == A.I) | (s == A.Q), need, A.R)
 
-    def _move(self):
+        # 3. new infections S -> I, biased toward communities already infected
+        need = int((s == A.S).sum()) - nS
+        if need > 0:
+            self._infect(need)
+
+        # 4. split the infectious pool to match the quarantine target
+        cQ = int((s == A.Q).sum())
+        if cQ < nQ:
+            self._isolate(nQ - cQ)
+        elif cQ > nQ:
+            self._release(cQ - nQ)
+
+    def _resolve_oldest(self, mask, need, new_status):
         a = self.agents
-        mobile = (a.statuses != Agents.Q) & (a.statuses != Agents.D)
-
-        displacement = (np.random.randn(a.n, 2) * MOVE_SPEED).astype(np.float32)
-        a.positions[mobile] += displacement[mobile]
-
-        # keep agents within their community rect
-        for c in range(N_COMMUNITIES):
-            mask = mobile & (a.communities == c)
-            if not mask.any():
-                continue
-            x0, y0 = self.community_centers[c]
-            x1 = x0 + COMMUNITY_SIZE[0]
-            y1 = y0 + COMMUNITY_SIZE[1]
-            a.positions[mask, 0] = np.clip(a.positions[mask, 0], x0, x1)
-            a.positions[mask, 1] = np.clip(a.positions[mask, 1], y0, y1)
-
-    def _jump(self):
-        a = self.agents
-        mobile = (a.statuses != Agents.Q) & (a.statuses != Agents.D)
-        roll = np.random.random(a.n)
-        jumpers = mobile & (roll < _agent.JUMP_PROB)
-        if not jumpers.any():
+        pool = np.where(mask)[0]
+        if pool.size == 0:
             return
+        order = pool[np.argsort(-a.days_infected[pool])]
+        pick = order[:need]
+        a.statuses[pick] = new_status
+        a.days_infected[pick] = 0.0
 
-        n_j = jumpers.sum()
-        direction = np.random.choice([-1, 1], size=n_j)
-        new_c = (a.communities[jumpers] + direction) % N_COMMUNITIES
-        a.communities[jumpers] = new_c
-
-        # Place inside the new community rect
-        origins = self.community_centers[new_c]
-        x0 = origins[:, 0]
-        y0 = origins[:, 1]
-        a.positions[jumpers, 0] = np.random.uniform(x0 + 1, x0 + COMMUNITY_SIZE[0] - 1, n_j)
-        a.positions[jumpers, 1] = np.random.uniform(y0 + 1, y0 + COMMUNITY_SIZE[1] - 1, n_j)
-
-    def _infect(self):
+    def _infect(self, need):
         a = self.agents
-        newly_infected = np.zeros(a.n, dtype=bool)
-
-        for c in range(N_COMMUNITIES):
-            i_mask = (a.statuses == Agents.I) & (a.communities == c)
-            s_mask = (a.statuses == Agents.S) & (a.communities == c)
-            if not i_mask.any() or not s_mask.any():
-                continue
-
-            i_pos = a.positions[i_mask]  # (n_i, 2)
-            s_pos = a.positions[s_mask]  # (n_s, 2)
-
-            # (n_i, n_s) pairwise distances
-            diff = s_pos[np.newaxis, :, :] - i_pos[:, np.newaxis, :]
-            dists = np.linalg.norm(diff, axis=2)
-
-            n_contacts = (dists < _agent.INFECTION_RADIUS).sum(axis=0)  # (n_s,)
-            effective_beta = BETA_SIM * (1.0 - self.u_current)
-            p_survive = (1.0 - effective_beta * DT) ** n_contacts
-
-            s_idx = np.where(s_mask)[0]
-            roll = np.random.random(len(s_idx))
-            newly_infected[s_idx[roll > p_survive]] = True
-
-        a.statuses[newly_infected] = Agents.I
-
-    def _quarantine(self):
-        if self.u_current <= 0:
+        s_idx = np.where(a.statuses == Agents.S)[0]
+        if s_idx.size == 0:
             return
+        need = min(need, s_idx.size)
+        inf_by_comm = np.bincount(
+            a.communities[a.statuses == Agents.I],
+            minlength=N_COMMUNITIES).astype(float)
+        w = 0.15 + inf_by_comm[a.communities[s_idx]]
+        w /= w.sum()
+        pick = np.random.choice(s_idx, size=need, replace=False, p=w)
+        a.statuses[pick] = Agents.I
+        a.days_infected[pick] = 0.0
+
+    def _isolate(self, need):
         a = self.agents
-        eligible = (a.statuses == Agents.I) & (a.days_infected > _agent.QUARANTINE_DELAY)
-        roll = np.random.random(a.n)
-        to_q = eligible & (roll < self.u_current * DT)
-        if not to_q.any():
+        i_idx = np.where(a.statuses == Agents.I)[0]
+        if i_idx.size == 0:
             return
-
-        a.statuses[to_q] = Agents.Q
+        need = min(need, i_idx.size)
+        # detect/isolate the longest-infected first
+        order = i_idx[np.argsort(-a.days_infected[i_idx])]
+        pick = order[:need]
+        a.statuses[pick] = Agents.Q
         qx, qy, qw, qh = QUARANTINE_RECT
-        n_q = int(to_q.sum())
-        a.positions[to_q] = np.column_stack([
-            np.random.uniform(qx + 10, qx + qw - 10, n_q),
-            np.random.uniform(qy + 10, qy + qh - 10, n_q),
+        a.positions[pick] = np.column_stack([
+            np.random.uniform(qx + 8, qx + qw - 8, need),
+            np.random.uniform(qy + 8, qy + qh - 8, need),
         ]).astype(np.float32)
 
-    def _die(self):
+    def _release(self, need):
         a = self.agents
-        can_die = (a.statuses == Agents.I) | (a.statuses == Agents.Q)
-        mu = self.state.get("mu_fit", 0.003)
-        roll = np.random.random(a.n)
-        died = can_die & (roll < mu * DT)
-        a.statuses[died] = Agents.D
-        a.days_infected[died] = 0.0
-
-    def _recover(self):
-        a = self.agents
-        can_recover = (a.statuses == Agents.I) | (a.statuses == Agents.Q)
-        roll = np.random.random(a.n)
-        recovered = can_recover & (roll < GAMMA_SIM * DT)
-        a.statuses[recovered] = Agents.R
-        a.days_infected[recovered] = 0.0
-
-    def _lose_immunity(self):
-        a = self.agents
-        omega = self.state.get("omega", 0.0)
-        if omega <= 0:
+        q_idx = np.where(a.statuses == Agents.Q)[0]
+        if q_idx.size == 0:
             return
-        recovered = a.statuses == Agents.R
-        roll = np.random.random(a.n)
-        lost = recovered & (roll < omega * DT)
-        a.statuses[lost] = Agents.S
+        need = min(need, q_idx.size)
+        pick = q_idx[:need]
+        a.statuses[pick] = Agents.I
+        ctr = self.centers[a.communities[pick]]
+        a.positions[pick] = (ctr + np.column_stack([
+            np.random.uniform(8, COMMUNITY_SIZE[0] - 8, need),
+            np.random.uniform(8, COMMUNITY_SIZE[1] - 8, need),
+        ])).astype(np.float32)
 
-    def _aggregate(self):
-        S, I, R, D = self.agents.sird_fractions()
-        with self.state['lock']:
-            self.state['S_history'].append(S)
-            self.state['I_history'].append(I)
-            self.state['R_history'].append(R)
-            self.state.setdefault('D_history', []).append(D)
-            self.state['t_history'].append(self.t_days)
-            self.state['t_days'] = self.t_days
-            self.state['u_current'] = self.u_current
+    # --- ageing & animation ---------------------------------------------------
 
-    # --- helpers ----------------------------------------------------------
+    def _age(self, dt_days):
+        a = self.agents
+        active = (a.statuses == Agents.I) | (a.statuses == Agents.Q)
+        a.days_infected[active] += dt_days
 
-    def set_u(self, u: float):
-        self.u_current = float(np.clip(u, 0.0, 1.0))
-
-    def get_sir(self) -> tuple[float, float, float]:
-        return self.agents.sir_fractions()
+    def _animate(self, u_L):
+        a = self.agents
+        s = a.statuses
+        amp = MOVE_SPEED * (1.0 - 0.92 * float(u_L))   # lockdown freezes movement
+        mob = (s == Agents.S) | (s == Agents.I) | (s == Agents.R)
+        if not mob.any():
+            return
+        disp = (np.random.randn(a.n, 2) * amp).astype(np.float32)
+        a.positions[mob] += disp[mob]
+        ctr = self.centers[a.communities]
+        a.positions[mob, 0] = np.clip(a.positions[mob, 0],
+                                      ctr[mob, 0], ctr[mob, 0] + COMMUNITY_SIZE[0])
+        a.positions[mob, 1] = np.clip(a.positions[mob, 1],
+                                      ctr[mob, 1], ctr[mob, 1] + COMMUNITY_SIZE[1])

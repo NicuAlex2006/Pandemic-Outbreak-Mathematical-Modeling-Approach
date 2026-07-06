@@ -1,93 +1,48 @@
 """
-Entry point: fit SIRD-S parameters from French COVID data at startup,
-then run the pygame simulation with a live dashboard.
+Optimal Epidemic Control — entry point.
 
-Startup (ONCE): fetch_france_data → fit_sird → solve_hjb → solve_binomial
-Per-alpha (worker): solve_hjb only (β,γ,μ frozen)
-Per-frame (main): u* lookup + ABM step + dashboard blit
+  1. Calibrate epidemic rates from France's first COVID wave.
+  2. Solve the two-control (lockdown + isolation) optimal-control problem (PMP).
+  3. Launch the pygame view: agents render the optimal ODE trajectory live,
+     and the parameter sliders re-solve the control on the fly.
+
+The ODE is the single ground truth — the particle cloud, the trajectory plot,
+and the policy are all the same solution.
 """
 
-import threading
-import numpy as np
-
+from models.adapter import calibrate, solve_optimal
+from models.sirdq import r0
 from simulation.world import World
 from simulation.renderer import Renderer
 from dashboard import Dashboard
-from models.adapter import (solve_hjb, solve_binomial_stopping,
-                            fit_sird, fetch_france_data)
-
-T_SIM = 365.0
-CARE_DEFAULT = 0.5
-URGENCY_DEFAULT = 0.5
-S0_DEFAULT = 0.80
-I0_DEFAULT = 0.20
 
 
 def main():
-    # =================================================================
-    # STARTUP — fit from real French COVID data, results frozen
-    # =================================================================
-    print("=== Startup: loading French COVID data ===")
-    try:
-        t_data, I_data, D_data, N_eff = fetch_france_data()
-        print(f"  {len(t_data)} days, N_eff={N_eff:.0f}")
-        print(f"  I peak={I_data.max():.4f}, D final={D_data[-1]:.6f}")
-    except Exception as e:
-        print(f"  OWID fetch failed ({e}), using synthetic data")
-        t_data = np.linspace(0, 10, 50)
-        I_data = I0_DEFAULT * np.exp(0.15 * t_data)
-        I_data = np.clip(I_data, 0, 0.5)
-        D_data = 0.02 * np.cumsum(I_data) * (t_data[1] - t_data[0])
-        D_data = np.clip(D_data, 0, 0.1)
+    print("=== Calibrating from France first wave ===")
+    params, info = calibrate()
+    print(f"  fitted R0   = {info['R0_fitted']:.2f}  (growth r={info['growth_rate']:.3f}/day)")
+    if info["suppressed"]:
+        print(f"  note: first wave was lockdown-suppressed; using unmitigated "
+              f"R0 = {info['R0_scenario']:.2f} for the baseline scenario")
+    print(f"  beta={params.beta:.3f}  gamma={params.gamma:.3f}  "
+          f"mu={params.mu:.4f}  R0={r0(params):.2f}")
 
-    print("=== Startup: fitting β, γ, μ (runs ONCE) ===")
-    beta, gamma, mu = fit_sird(I_data, D_data, S0_DEFAULT, I0_DEFAULT,
-                                T=t_data[-1])
-    cfr = mu / (mu + gamma) if (mu + gamma) > 0 else 0.0
-    print(f"  β={beta:.4f}  γ={gamma:.4f}  μ={mu:.6f}")
-    print(f"  CFR = {cfr*100:.2f}%")
+    print("=== Solving optimal control (PMP forward-backward sweep) ===")
+    traj = solve_optimal(params)
+    print(f"  converged={traj.converged} in {traj.iters} iters")
+    print(f"  peak I={traj.I.max():.3f} (cap {params.I_cap})  "
+          f"final D={traj.D[-1]*100:.2f}%")
+    print(f"  u_L max={traj.u_L.max():.2f}  u_Q max={traj.u_Q.max():.2f}  "
+          f"R_eff min={traj.Reff.min():.2f}")
+    print("=== Launching ===\n")
 
-    print("=== Startup: initial HJB solve ===")
-    V, u_opt, S_grid, I_grid, g_array, stopped_frac = solve_hjb(
-        beta, gamma, care=CARE_DEFAULT, T=T_SIM, mu=mu,
-    )
-    print(f"  V range: [{V.min():.3f}, {V.max():.3f}]  u_opt: {u_opt.shape}")
-    print(f"  Stopping: {'Yes' if stopped_frac > 0.01 else 'No'} ({stopped_frac:.1%})")
+    world = World()
+    world.setup(n_initial_infected=8)
+    world.set_trajectory(traj, reset_playhead=True)
 
-    print("=== Startup: binomial stopping tree ===")
-    _, stop_tree, betas_tree = solve_binomial_stopping(beta, gamma, I0_DEFAULT)
-    print(f"  Nodes: {len(stop_tree)}")
-    print("=== Startup complete ===\n")
+    dashboard = Dashboard(params, traj, info)
 
-    from simulation.agent import N as N_AGENTS
-    n_initial_infected = 5
-    I0_sim = n_initial_infected / N_AGENTS
-    S0_sim = 1.0 - I0_sim
-
-    shared_state = {
-        "S_history": [], "I_history": [], "R_history": [],
-        "D_history": [], "t_history": [],
-        "t_days": 0.0, "u_current": 0.0,
-        "beta_fit": beta, "gamma_fit": gamma, "mu_fit": mu,
-        "u_opt": u_opt, "S_grid": S_grid, "I_grid": I_grid,
-        "care": CARE_DEFAULT, "urgency": URGENCY_DEFAULT,
-        "p_enact": CARE_DEFAULT * URGENCY_DEFAULT,
-        "omega": 0.0, "I0": I0_sim, "S0": S0_sim,
-        "lock": threading.Lock(), "hjb_running": False,
-    }
-
-    dashboard = Dashboard(
-        beta=beta, gamma=gamma, mu=mu,
-        V=V, u_opt=u_opt, g_array=g_array,
-        S_grid=S_grid, I_grid=I_grid,
-        care=CARE_DEFAULT, urgency=URGENCY_DEFAULT,
-        T=T_SIM, stopped_frac=stopped_frac,
-    )
-
-    world = World(shared_state=shared_state)
-    world.setup()
-    renderer = Renderer(world=world, shared_state=shared_state,
-                        dashboard=dashboard)
+    renderer = Renderer(world, dashboard, params)
     renderer.setup()
     renderer.run()
 

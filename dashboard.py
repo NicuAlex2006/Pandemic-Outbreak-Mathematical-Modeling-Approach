@@ -1,10 +1,13 @@
 """
-Dashboard with two panels rendered via Agg into a pygame surface.
+Dashboard — three Agg-rendered panels blitted into pygame.
 
-Panel 1: Population trajectory — S (blue), I (red), R (green), D (black)
-Panel 2: HJB Free Boundary (stopping region)
+ Panel 1  optimal trajectory S/I/Q/R/D vs t, with the hospital-capacity line
+          and a live playhead.
+ Panel 2  the two optimal controls u_L(t), u_Q(t) and R_eff(t) (target = 1).
+ Panel 3  text stats + cost breakdown (the realised objective J).
 
-Worker thread re-solves HJB when alpha or ABM-derived rates change.
+A worker thread re-solves the PMP optimal control whenever the parameters
+change, so the UI never blocks.
 """
 
 import queue
@@ -18,299 +21,202 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 import pygame
 
-from models.adapter import sirds_euler, solve_hjb
+from models.adapter import solve_optimal
+from models.pmp import cost_breakdown
+from models.sirdq import r0
 
-REFRESH_INTERVAL = 0.5
+REFRESH_INTERVAL = 0.4
 
 
 class Dashboard:
+    def __init__(self, params, trajectory, info=None):
+        self.params = params
+        self.trajectory = trajectory
+        self.info = info or {}
 
-    def __init__(self, beta, gamma, mu, V, u_opt, g_array, S_grid, I_grid,
-                 care, urgency, T, stopped_frac=0.0):
-        self.beta = beta
-        self.gamma = gamma
-        self.mu = mu
-        self.omega = 0.0
-        self.V = V
-        self.u_opt = u_opt
-        self.g_array = g_array
-        self.S_grid = S_grid
-        self.I_grid = I_grid
-        self.care = care
-        self.urgency = urgency
-        self.T = T
-        self.stopping = stopped_frac > 0.01
-        self.I0 = 5 / 8000.0
-        self.S0 = 1.0 - self.I0
-
-        self.beta_eff = beta
-        self.gamma_eff = gamma
-
-        self.paused = False
-        self._phase_S = []
-        self._phase_I = []
-
-        self._last_solve_dur = 0.0
         self._worker_status = "idle"
-        self._fps = 0.0
-        self._frame_count = 0
-        self._fps_timer = time.monotonic()
+        self._last_solve_ms = 0.0
+        self.fps = 0.0
 
-        self.solve_request_q = queue.Queue(maxsize=1)
-        self.solve_result_q = queue.Queue()
+        self.req_q = queue.Queue(maxsize=1)
+        self.res_q = queue.Queue()
         self.worker = threading.Thread(target=self._solver_loop, daemon=True)
         self.worker.start()
 
-        self.fig = plt.figure(figsize=(5.5, 7.0), dpi=100)
+        self.fig = plt.figure(figsize=(5.6, 7.7), dpi=100)
         gs = self.fig.add_gridspec(
-            2, 2, width_ratios=[1, 0.45],
-            hspace=0.4, wspace=0.35,
-            left=0.10, right=0.97, top=0.95, bottom=0.06,
-        )
-        self.ax_traj = self.fig.add_subplot(gs[0, 0])
-        self.ax_stop = self.fig.add_subplot(gs[1, 0])
-        self.ax_debug = self.fig.add_subplot(gs[:, 1])
-        self.ax_debug.axis("off")
+            3, 1, height_ratios=[1.15, 0.95, 0.85],
+            hspace=0.42, left=0.12, right=0.96, top=0.96, bottom=0.05)
+        self.ax_traj = self.fig.add_subplot(gs[0])
+        self.ax_ctrl = self.fig.add_subplot(gs[1])
+        self.ax_stats = self.fig.add_subplot(gs[2])
+        self.ax_stats.axis("off")
+        self.ax_reff = self.ax_ctrl.twinx()
 
         self.canvas = FigureCanvasAgg(self.fig)
         self.surface = None
         self._last_render = 0.0
 
-    # --- worker (only solve_hjb) --------------------------------------------
+    # --- worker --------------------------------------------------------------
 
     def _solver_loop(self):
         while True:
-            req = self.solve_request_q.get()
+            req = self.req_q.get()
             if req is None:
                 return
-            care, beta_eff, gamma_eff, mu = req
-            self._worker_status = f"solving care={care:.2f}"
+            self._worker_status = "solving…"
             t0 = time.monotonic()
             try:
-                V_new, u_new, S_g, I_g, g_new, stopped_frac = solve_hjb(
-                    beta_eff, gamma_eff, care=care,
-                    T=self.T, mu=mu,
-                )
-                dur = time.monotonic() - t0
-                self.solve_result_q.put((care, beta_eff, gamma_eff,
-                                         V_new, u_new, S_g, I_g, g_new,
-                                         stopped_frac, dur))
-            except Exception as e:
-                self.solve_result_q.put(("error", e))
+                traj = solve_optimal(req)
+                self._last_solve_ms = (time.monotonic() - t0) * 1e3
+                self.res_q.put(("ok", req, traj))
+            except Exception as e:               # noqa: BLE001
+                self.res_q.put(("err", req, e))
             self._worker_status = "idle"
 
-    def request_solve(self, care, beta_eff, gamma_eff, mu):
+    def request_solve(self, params):
         try:
-            self.solve_request_q.get_nowait()
+            self.req_q.get_nowait()
         except queue.Empty:
             pass
-        self.solve_request_q.put_nowait((care, beta_eff, gamma_eff, mu))
+        try:
+            self.req_q.put_nowait(params)
+        except queue.Full:
+            pass
 
     def poll_worker(self):
+        """Return a fresh Trajectory if the worker produced one, else None."""
         try:
-            result = self.solve_result_q.get_nowait()
-            if result[0] == "error":
-                self._worker_status = f"error: {result[1]}"
-                return
-            (care_done, beta_eff, gamma_eff,
-             V_new, u_new, S_g, I_g, g_new,
-             stopped_frac, dur) = result
-            self.care = care_done
-            self.beta_eff = beta_eff
-            self.gamma_eff = gamma_eff
-            self.V = V_new
-            self.u_opt = u_new
-            self.S_grid = S_g
-            self.I_grid = I_g
-            self.g_array = g_new
-            self.stopping = stopped_frac > 0.01
-            self._last_solve_dur = dur
+            tag, params, payload = self.res_q.get_nowait()
         except queue.Empty:
-            pass
+            return None
+        if tag == "err":
+            self._worker_status = f"error: {payload}"
+            return None
+        self.params = params
+        self.trajectory = payload
+        return payload
 
-    # --- tracking -----------------------------------------------------------
+    # --- render --------------------------------------------------------------
 
-    def accumulate(self, t, S, I):
-        self._phase_S.append(S)
-        self._phase_I.append(I)
-
-    def reset_tracking(self):
-        self._phase_S.clear()
-        self._phase_I.clear()
-
-    # --- render -------------------------------------------------------------
-
-    def render_to_surface(self, shared_state):
+    def render_to_surface(self, t_days):
         now = time.monotonic()
-        if now - self._last_render < REFRESH_INTERVAL:
+        if self.surface is not None and now - self._last_render < REFRESH_INTERVAL:
             return self.surface
         self._last_render = now
 
-        self._frame_count += 1
-        elapsed = now - self._fps_timer
-        if elapsed >= 1.0:
-            self._fps = self._frame_count / elapsed
-            self._frame_count = 0
-            self._fps_timer = now
-
-        self.poll_worker()
-        self._draw_trajectory(self.ax_traj, shared_state)
-        self._draw_free_boundary(self.ax_stop)
-        self._draw_debug(self.ax_debug, shared_state)
+        self._draw_trajectory(t_days)
+        self._draw_controls(t_days)
+        self._draw_stats(t_days)
 
         self.canvas.draw()
         buf = self.canvas.buffer_rgba()
         w, h = self.canvas.get_width_height()
-        rgb = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 4)[:, :, :3].copy()
+        rgb = np.frombuffer(buf, np.uint8).reshape(h, w, 4)[:, :, :3].copy()
         self.surface = pygame.image.frombuffer(rgb.tobytes(), (w, h), "RGB")
         return self.surface
 
-    # --- Panel 1: Population S/I/R/D ---------------------------------------
-
-    def _draw_trajectory(self, ax, state):
+    def _draw_trajectory(self, t_days):
+        ax = self.ax_traj
         ax.clear()
-        with state["lock"]:
-            t = list(state["t_history"])
-            S = list(state["S_history"])
-            I = list(state["I_history"])
-            R = list(state["R_history"])
-            D = list(state.get("D_history", []))
-
-        if len(t) < 2:
-            ax.set_title("Population (waiting)", fontsize=8)
-            ax.tick_params(labelsize=6)
-            return
-
-        t_arr = np.array(t)
-        n = min(len(t_arr), len(S), len(I), len(R))
-        ax.plot(t_arr[:n], S[:n], "b-", lw=1.0, label="S")
-        ax.plot(t_arr[:n], I[:n], "r-", lw=1.0, label="I")
-        ax.plot(t_arr[:n], R[:n], "g-", lw=1.0, label="R")
-        if D:
-            nd = min(n, len(D))
-            ax.plot(t_arr[:nd], D[:nd], "k-", lw=1.2, label="D")
-
-        if self.beta_eff > 0 and self.gamma_eff > 0 and len(t) > 20:
-            n_pts = min(200, len(t))
-            S_f, I_f, R_f, D_f, t_f = sirds_euler(
-                self.beta_eff, self.gamma_eff, self.mu,
-                self.S0, self.I0, t_arr[-1], n_pts, omega=self.omega)
-            ax.plot(t_f, S_f, "b--", lw=0.5, alpha=0.4)
-            ax.plot(t_f, I_f, "r--", lw=0.5, alpha=0.4)
-            ax.plot(t_f, R_f, "g--", lw=0.5, alpha=0.4)
-            ax.plot(t_f, D_f, "k--", lw=0.5, alpha=0.4)
-
-        ax.axvline(0, color='#00CC66', lw=0.8, ls='--', alpha=0.5)
-
+        tr, p = self.trajectory, self.params
+        ax.plot(tr.t, tr.S, color="#6495ED", lw=1.3, label="S")
+        ax.plot(tr.t, tr.I, color="#DC3232", lw=1.6, label="I")
+        ax.plot(tr.t, tr.Q, color="#FFA500", lw=1.3, label="Q")
+        ax.plot(tr.t, tr.R, color="#3CB371", lw=1.3, label="R")
+        ax.plot(tr.t, tr.D, color="#222222", lw=1.3, label="D")
+        ax.axhline(p.I_cap, color="#DC3232", lw=0.9, ls=":", alpha=0.7)
+        ax.text(tr.t[-1], p.I_cap, " I_cap", color="#DC3232",
+                fontsize=6, va="bottom", ha="right")
+        ax.axvline(t_days, color="#00CC66", lw=1.0, alpha=0.8)
         ax.set_ylim(0, 1)
+        ax.set_xlim(tr.t[0], tr.t[-1])
         ax.set_xlabel("t (days)", fontsize=7)
         ax.set_ylabel("fraction", fontsize=7)
-        ax.set_title(f"SIRD-S  " + r"$\beta$" + f"*={self.beta_eff:.3f}  "
-                     + r"$\gamma$" + f"*={self.gamma_eff:.3f}  "
-                     + r"$\mu$" + f"={self.mu:.4f}"
-                     + f"  I0={self.I0:.4f}", fontsize=7)
-        ax.legend(fontsize=5, loc="right")
+        ax.set_title("Optimal epidemic trajectory (ODE = ground truth)",
+                     fontsize=8)
+        ax.legend(fontsize=6, ncol=5, loc="upper right", columnspacing=0.8,
+                  handlelength=1.1)
         ax.tick_params(labelsize=6)
+        ax.grid(alpha=0.15)
 
-    # --- Panel 2: HJB Free Boundary ----------------------------------------
-
-    def _draw_free_boundary(self, ax):
+    def _draw_controls(self, t_days):
+        ax, axr = self.ax_ctrl, self.ax_reff
         ax.clear()
-        if self.V is None or self.g_array is None:
-            ax.set_title("Free boundary (waiting)", fontsize=8)
-            ax.tick_params(labelsize=6)
-            return
-
-        stop_mask = np.isclose(self.V, self.g_array, rtol=1e-3, atol=1e-5)
-        nS, nI = self.V.shape
-        s_c = np.linspace(0, 1, nS)
-        i_c = np.linspace(0, 1, nI)
-
-        ax.contourf(i_c, s_c, stop_mask.astype(float),
-                    levels=[0.5, 1.5], colors=["#ffcccc"], alpha=0.5)
-        ax.contour(i_c, s_c, stop_mask.astype(float),
-                   levels=[0.5], colors=["#cc0000"], linewidths=1.0)
-
-        ax.plot(self.I0, self.S0, marker='*', color='#00CC66',
-                ms=10, mec='white', mew=0.5, zorder=5)
-
-        if len(self._phase_S) > 1:
-            ax.plot(self._phase_I, self._phase_S, "k-", lw=0.5, alpha=0.4)
-            ax.plot(self._phase_I[-1], self._phase_S[-1], "ro", ms=5)
-
-        ax.set_xlim(0, 1)
+        axr.clear()
+        tr = self.trajectory
+        ax.fill_between(tr.t, 0, tr.u_L, color="#4C72B0", alpha=0.30)
+        ax.plot(tr.t, tr.u_L, color="#4C72B0", lw=1.5, label="u_L lockdown")
+        ax.plot(tr.t, tr.u_Q, color="#FFA500", lw=1.5, label="u_Q isolation")
+        ax.axvline(t_days, color="#00CC66", lw=1.0, alpha=0.8)
         ax.set_ylim(0, 1)
-        ax.set_xlabel("I", fontsize=7)
-        ax.set_ylabel("S", fontsize=7)
-        ax.set_title(f"HJB Free Boundary  care={self.care:.2f} urg={self.urgency:.2f}", fontsize=8)
+        ax.set_xlim(tr.t[0], tr.t[-1])
+        ax.set_xlabel("t (days)", fontsize=7)
+        ax.set_ylabel("control", fontsize=7)
+        ax.set_title("Optimal controls  &  effective reproduction number",
+                     fontsize=8)
         ax.tick_params(labelsize=6)
+        ax.grid(alpha=0.15)
 
-    # --- Debug panel --------------------------------------------------------
+        axr.plot(tr.t, tr.Reff, color="#8855CC", lw=1.2, ls="--",
+                 label="R_eff")
+        axr.axhline(1.0, color="#8855CC", lw=0.8, ls=":", alpha=0.6)
+        axr.set_ylim(0, max(3.0, float(np.nanmax(tr.Reff)) * 1.1))
+        axr.set_ylabel("R_eff", fontsize=7, color="#8855CC")
+        axr.tick_params(labelsize=6, colors="#8855CC")
 
-    def _draw_debug(self, ax, state):
+        h1, l1 = ax.get_legend_handles_labels()
+        h2, l2 = axr.get_legend_handles_labels()
+        ax.legend(h1 + h2, l1 + l2, fontsize=6, loc="upper right")
+
+    def _draw_stats(self, t_days):
+        ax = self.ax_stats
         ax.clear()
         ax.axis("off")
-        with state["lock"]:
-            t = state.get("t_days", 0.0)
-            u = state.get("u_current", 0.0)
-            S_h = list(state.get("S_history", []))
-            I_h = list(state.get("I_history", []))
-            R_h = list(state.get("R_history", []))
-            D_h = list(state.get("D_history", []))
-            omega = state.get("omega", 0.0)
+        tr, p = self.trajectory, self.params
+        smp = tr.at(t_days)
+        cb = cost_breakdown(tr)
 
-        S = S_h[-1] if S_h else 0.0
-        I = I_h[-1] if I_h else 0.0
-        R = R_h[-1] if R_h else 0.0
-        D = D_h[-1] if D_h else 0.0
-        R0eff = self.beta_eff * (1 - u) * S / self.gamma_eff if self.gamma_eff > 0 else 0.0
-        cfr = self.mu / (self.mu + self.gamma) if (self.mu + self.gamma) > 0 else 0.0
-
-        inf_r = state.get("infection_radius", 4)
-        jump_p = state.get("jump_prob", 0.007)
-        q_delay = state.get("quarantine_delay", 3.0)
-
-        stopping_str = "Yes" if self.stopping else "No"
-        lines = [
-            "── State ──",
-            f"t     = {t:.1f}",
-            f"S     = {S:.4f}",
-            f"I     = {I:.4f}",
-            f"R     = {R:.4f}",
-            f"D     = {D:.4f}",
-            f"u*    = {u:.4f}",
-            f"R0eff = {R0eff:.2f}",
-            f"Stopping: {stopping_str}",
-            "",
-            "── Policy ──",
-            f"care    = {self.care:.2f}",
-            f"urgency = {self.urgency:.2f}",
-            f"p_enact = {max(0.02, self.urgency*self.care):.2f}",
-            f"I0      = {self.I0:.4f}",
-            "",
-            "── Params ──",
-            f"β     = {self.beta:.4f}",
-            f"γ     = {self.gamma:.4f}",
-            f"mu    = {self.mu:.5f}",
-            f"CFR   = {cfr*100:.2f}%",
-            f"ω     = {omega:.4f}",
-            "",
-            "── ABM ──",
-            f"inf_r = {inf_r}",
-            f"jump  = {jump_p:.4f}",
-            f"q_del = {q_delay:.1f}",
-            f"β_eff = {self.beta_eff:.4f}",
-            f"γ_eff = {self.gamma_eff:.4f}",
-            "",
-            "── Worker ──",
-            f"{self._worker_status}",
-            f"last: {self._last_solve_dur:.1f}s",
-            f"fps:  {self._fps:.0f}",
+        col1 = [
+            "── now ──",
+            f"t      = {t_days:6.1f} d",
+            f"S      = {smp['S']:.3f}",
+            f"I      = {smp['I']:.3f}",
+            f"Q      = {smp['Q']:.3f}",
+            f"R      = {smp['R']:.3f}",
+            f"D      = {smp['D']:.4f}",
+            f"u_L    = {smp['u_L']:.2f}",
+            f"u_Q    = {smp['u_Q']:.2f}",
+            f"R_eff  = {smp['Reff']:.2f}",
         ]
-        for idx, line in enumerate(lines):
-            color = "#cccccc"
-            if line.startswith("──"):
-                color = "#8888aa"
-            ax.text(0.05, 0.97 - idx * 0.033, line, fontsize=5,
-                    family="monospace", color=color, va="top",
-                    transform=ax.transAxes)
+        col2 = [
+            "── scenario ──",
+            f"R0      = {r0(p):.2f}",
+            f"R0 fit  = {self.info.get('R0_fitted', float('nan')):.2f}",
+            f"peak I  = {tr.I.max():.3f}",
+            f"cap     = {p.I_cap:.3f}",
+            f"finalD  = {tr.D[-1]*100:.2f}%",
+            "── cost J ──",
+            f"burden  = {cb['burden']:.3f}",
+            f"deaths  = {cb['deaths']:.3f}",
+            f"lockdwn = {cb['lockdown']:.3f}",
+            f"quaran. = {cb['quarantine']:.3f}",
+            f"capacty = {cb['capacity']:.3f}",
+            f"TOTAL J = {cb['total']:.3f}",
+        ]
+        foot = (f"solve {self._last_solve_ms:.0f}ms · {self._worker_status}"
+                f" · {'conv' if tr.converged else 'partial'} · fps {self.fps:.0f}")
+
+        for i, line in enumerate(col1):
+            c = "#8888aa" if line.startswith("──") else "#cccccc"
+            ax.text(0.02, 0.97 - i * 0.085, line, fontsize=6.5,
+                    family="monospace", color=c, va="top", transform=ax.transAxes)
+        for i, line in enumerate(col2):
+            c = "#8888aa" if line.startswith("──") else "#cccccc"
+            ax.text(0.52, 0.97 - i * 0.072, line, fontsize=6.5,
+                    family="monospace", color=c, va="top", transform=ax.transAxes)
+        ax.text(0.02, 0.02, foot, fontsize=6, family="monospace",
+                color="#777799", va="bottom", transform=ax.transAxes)
+
+    def shutdown(self):
+        self.req_q.put(None)
